@@ -1,0 +1,84 @@
+# Master Pipeline
+
+pool:
+    vmImage: 'Ubuntu 16.04'
+
+trigger:
+ branches:
+    include:
+    - master
+
+variables:
+  # In case changing subscription see  
+  # https://docs.microsoft.com/en-us/azure/devops/pipelines/process/resources?view=azure-devops&viewFallbackFrom=vsts#troubleshooting-authorization-for-a-yaml-pipeline
+  Azure.ServiceConnectionId: 'Project Vienna Build (ad203158-bc5d-4e72-b764-2607833a71dc)'
+  GOBIN:  '$(GOPATH)/bin' # Go binaries path
+  ACRSERVER: 'viennadroptest'
+  IMAGENAME:  '$(ACRSERVER).azurecr.io/mircontrollers:$(Build.BuildNumber)'
+  GOPATH: '$(system.defaultWorkingDirectory)/gopath' # Go workspace path
+  modulePath: '$(GOPATH)/src/$(build.repository.name)' # Path to the controllers's code
+
+steps:
+- task: GoTool@0
+  displayName: 'Use Go 1.10'
+  inputs:
+    goPath: '$(GOPATH)'
+    goBin: '$(GOBIN)'
+
+- script: |
+    mkdir -p '$(GOBIN)'
+    mkdir -p '$(GOPATH)/pkg'
+    mkdir -p '$(modulePath)'
+    shopt -s extglob
+    mv !(gopath) '$(modulePath)'
+    echo '##vso[task.prependpath]$(GOBIN)'
+    echo '##vso[task.prependpath]$(GOROOT)/bin'
+    go env
+  displayName: 'Set up the Go workspace'
+
+- task: Bash@3
+  displayName: 'Install go dep, KubeBuilder, kustomize'
+  inputs:
+    targetType: filePath
+    filePath: '$(modulePath)/scripts/vsts-agent-setup.sh'
+
+- script: |
+    go get -v -t -d ./...
+    if [ -f Gopkg.toml ]; then
+        echo "dep ensure"
+    fi
+    make manager
+  workingDirectory: '$(modulePath)'
+  displayName: 'Get dependencies, then build'
+
+- bash: |
+     make docker-build IMAGE=$(IMAGENAME)
+  displayName: 'Build the Docker image for the controller'
+  workingDirectory: '$(modulePath)'
+
+- bash: |
+     make generateOutputSpecs
+     cp -r generatedSpecs $(build.artifactstagingdirectory)/sourceCrds
+     export KO_DOCKER_REPO='ko.local'
+     echo 'combining all the yaml file'
+     # Using ko to just combine all the yaml into 1 file
+     ko resolve -f ./generatedSpecs > $(build.artifactstagingdirectory)/deploy.yaml
+     ls $(build.artifactstagingdirectory)
+  displayName: 'Copy CRDs yaml and kustomize output to artifactstagingdirectory directory'
+  workingDirectory: '$(modulePath)'
+
+- task: AzureCLI@1
+  displayName: 'Push controller image'
+  inputs:
+    azureSubscription: '$(Azure.ServiceConnectionId)'
+    scriptLocation: inlineScript
+    inlineScript: |
+      az acr login -n $(ACRSERVER)
+      make docker-push IMAGE=$(IMAGENAME)
+    workingDirectory: '$(modulePath)'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish CRDs and the yaml file for deployment as artifacts from $(build.artifactstagingdirectory)'
+  inputs:
+      PathtoPublish: '$(build.artifactstagingdirectory)'
+      artifactName: 'crds'
